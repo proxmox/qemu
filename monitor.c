@@ -2666,6 +2666,13 @@ static mon_cmd_t info_cmds[] = {
     },
 #endif
     {
+        .name       = "backup",
+        .args_type  = "",
+        .params     = "",
+        .help       = "show backup status",
+        .mhandler.cmd = hmp_info_backup,
+    },
+    {
         .name       = "migrate",
         .args_type  = "",
         .params     = "",

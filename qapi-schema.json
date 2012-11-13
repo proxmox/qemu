@@ -425,6 +425,39 @@
 { 'type': 'EventInfo', 'data': {'name': 'str'} }
 
 ##
+# @BackupStatus:
+#
+# Detailed backup status.
+#
+# @status: #optional string describing the current backup status.
+#          This can be 'active', 'done', 'error'. If this field is not
+#          returned, no backup process has been initiated
+#
+# @errmsg: #optional error message (only returned if status is 'error')
+#
+# @total: #optional total amount of bytes involved in the backup process
+#
+# @transferred: #optional amount of bytes already backed up.
+#
+# @zero-bytes: #optional amount of 'zero' bytes detected.
+#
+# @start-time: #optional time (epoch) when backup job started.
+#
+# @end-time: #optional time (epoch) when backup job finished.
+#
+# @backupfile: #optional backup file name
+#
+# @uuid: #optional uuid for this backup job
+#
+# Since: 1.5.0
+##
+{ 'type': 'BackupStatus',
+  'data': {'*status': 'str', '*errmsg': 'str', '*total': 'int',
+           '*transferred': 'int', '*zero-bytes': 'int',
+           '*start-time': 'int', '*end-time': 'int',
+           '*backup-file': 'str', '*uuid': 'str' } }
+
+##
 # @query-events:
 #
 # Return a list of supported QMP events by this server
@@ -1823,6 +1856,68 @@
 { 'command': 'qom-list',
   'data': { 'path': 'str' },
   'returns': [ 'ObjectPropertyInfo' ] }
+
+
+##
+# @BackupFormat
+#
+# An enumeration of supported backup formats.
+#
+# @vma: Proxmox vma backup format
+##
+{ 'enum': 'BackupFormat',
+  'data': [ 'vma' ] }
+
+##
+# @backup:
+#
+# Starts a VM backup.
+#
+# @backup-file: the backup file name
+#
+# @format: format of the backup file
+#
+# @config-filename: #optional name of a configuration file to include into
+# the backup archive.
+#
+# @speed: #optional the maximum speed, in bytes per second
+#
+# @devlist: #optional list of block device names (separated by ',', ';'
+# or ':'). By default the backup includes all writable block devices.
+#
+# Returns: the uuid of the backup job
+#
+# Since: 1.5.0
+##
+{ 'command': 'backup', 'data': { 'backup-file': 'str',
+                                 '*format': 'BackupFormat',
+                                 '*config-file': 'str',
+                                 '*devlist': 'str', '*speed': 'int' },
+  'returns': 'str' }
+
+##
+# @query-backup
+#
+# Returns information about current/last backup task.
+#
+# Returns: @BackupStatus
+#
+# Since: 1.5.0
+##
+{ 'command': 'query-backup', 'returns': 'BackupStatus' }
+
+##
+# @backup-cancel
+#
+# Cancel the current executing backup process.
+#
+# Returns: nothing on success
+#
+# Notes: This command succeeds even if there is no backup process running.
+#
+# Since: 1.5.0
+##
+{ 'command': 'backup-cancel' }
 
 ##
 # @qom-get:
