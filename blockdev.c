@@ -21,6 +21,7 @@
 #include "trace.h"
 #include "sysemu/arch_init.h"
 #include "backup.h"
+#include "vma.h"
 
 static QTAILQ_HEAD(drivelist, DriveInfo) drives = QTAILQ_HEAD_INITIALIZER(drives);
 
@@ -1530,10 +1531,11 @@ char *qmp_backup(const char *backup_file, bool has_format, BackupFormat format,
     /* Todo: try to auto-detect format based on file name */
     format = has_format ? format : BACKUP_FORMAT_VMA;
 
-    /* fixme: find driver for specifued format */
     const BackupDriver *driver = NULL;
 
-    if (!driver) {
+    if (format == BACKUP_FORMAT_VMA) {
+        driver = &backup_vma_driver;
+    } else {
         error_set(errp, ERROR_CLASS_GENERIC_ERROR, "unknown backup format");
         return NULL;
     }

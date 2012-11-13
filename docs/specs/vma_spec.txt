@@ -1,0 +1,24 @@
+=Virtual Machine Archive format (VMA)=
+
+This format contains a header which includes the VM configuration as
+binary blobs, and a list of devices (dev_id, name).
+
+The actual VM image data is stored inside extents. An extent contains
+up to 64 clusters, and start with a 512 byte header containing
+additional information for those clusters.
+
+We use a cluster size of 65536, and use 8 bytes for each
+cluster in the header to store the following information:
+
+* 1 byte dev_id (to identity the drive)
+* 1 byte not used (reserved)
+* 2 bytes zero indicator (mark zero regions (16x4096))
+* 4 bytes cluster number
+
+We only store non-zero blocks (such block is 4096 bytes).
+
+Each archive is marked with a uuid. The archive header and all
+extent headers includes that uuid and a MD5 checksum (over header
+data).
+
+
