@@ -83,6 +83,35 @@ STEXI
 Copy data from a backing file into a block device.
 ETEXI
 
+   {
+        .name       = "backup",
+        .args_type  = "backupfile:s,speed:o?,devlist:s?",
+        .params     = "backupfile [speed [devlist]]",
+        .help       = "create a VM Backup.",
+        .mhandler.cmd = hmp_backup,
+    },
+
+STEXI
+@item backup
+@findex backup
+Create a VM backup.
+ETEXI
+
+    {
+        .name       = "backup_cancel",
+        .args_type  = "",
+        .params     = "",
+        .help       = "cancel the current VM backup",
+        .mhandler.cmd = hmp_backup_cancel,
+    },
+
+STEXI
+@item backup_cancel
+@findex backup_cancel
+Cancel the current VM backup.
+
+ETEXI
+
     {
         .name       = "block_job_set_speed",
         .args_type  = "device:B,speed:o",
@@ -1630,6 +1659,8 @@ show CPU statistics
 show user network stack connection states
 @item info migrate
 show migration status
+@item info backup
+show backup status
 @item info migrate_capabilities
 show current migration capabilities
 @item info migrate_cache_size

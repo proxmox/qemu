@@ -20,6 +20,7 @@
 #include "qmp-commands.h"
 #include "trace.h"
 #include "sysemu/arch_init.h"
+#include "backup.h"
 
 static QTAILQ_HEAD(drivelist, DriveInfo) drives = QTAILQ_HEAD_INITIALIZER(drives);
 
@@ -1332,6 +1333,428 @@ void qmp_drive_mirror(const char *device, const char *target,
      * underneath us.
      */
     drive_get_ref(drive_get_by_blockdev(bs));
+}
+
+/* Backup related function */
+
+static void backup_run_next_job(void);
+
+static struct GenericBackupState {
+    Error *error;
+    bool cancel;
+    uuid_t uuid;
+    char uuid_str[37];
+    int64_t speed;
+    time_t start_time;
+    time_t end_time;
+    char *backup_file;
+    const BackupDriver *driver;
+    void *writer;
+    GList *bcb_list;
+    size_t total;
+    size_t transferred;
+    size_t zero_bytes;
+} backup_state;
+
+typedef struct BackupCB {
+    BlockDriverState *bs;
+    uint8_t dev_id;
+    bool started;
+    bool completed;
+    size_t size;
+    size_t transferred;
+    size_t zero_bytes;
+} BackupCB;
+
+static int backup_dump_cb(void *opaque, BlockDriverState *bs,
+                          int64_t cluster_num, unsigned char *buf)
+{
+    BackupCB *bcb = opaque;
+
+    assert(backup_state.driver);
+    assert(backup_state.writer);
+    assert(backup_state.driver->dump);
+
+    size_t zero_bytes = 0;
+    int bytes = backup_state.driver->dump(backup_state.writer,
+                                          bcb->dev_id, cluster_num,
+                                          buf, &zero_bytes);
+
+    if (bytes > 0) {
+        bcb->transferred += bytes;
+        backup_state.transferred += bytes;
+        if (zero_bytes) {
+            bcb->zero_bytes += bytes;
+            backup_state.zero_bytes += zero_bytes;
+        }
+    }
+
+    return bytes;
+}
+
+static void backup_cleanup(void)
+{
+    if (backup_state.writer && backup_state.driver) {
+        backup_state.end_time = time(NULL);
+        Error *local_err = NULL;
+        backup_state.driver->close(backup_state.writer, &local_err);
+        error_propagate(&backup_state.error, local_err);
+        backup_state.writer = NULL;
+    }
+
+    if (backup_state.bcb_list) {
+        GList *l = backup_state.bcb_list;
+        while (l) {
+            BackupCB *bcb = l->data;
+            l = g_list_next(l);
+            drive_put_ref_bh_schedule(drive_get_by_blockdev(bcb->bs));
+            g_free(bcb);
+        }
+        g_list_free(backup_state.bcb_list);
+        backup_state.bcb_list = NULL;
+    }
+}
+
+static void backup_complete_cb(void *opaque, int ret)
+{
+    BackupCB *bcb = opaque;
+
+    assert(backup_state.driver);
+    assert(backup_state.writer);
+    assert(backup_state.driver->complete);
+    assert(backup_state.driver->close);
+
+    bcb->completed = true;
+
+    backup_state.driver->complete(backup_state.writer, bcb->dev_id, ret);
+
+    if (!backup_state.cancel) {
+        backup_run_next_job();
+    }
+}
+
+static void backup_cancel(void)
+{
+    backup_state.cancel = true;
+
+    if (!backup_state.error) {
+        error_setg(&backup_state.error, "backup cancelled");
+    }
+
+    /* drain all i/o (awake jobs waiting for aio) */
+    bdrv_drain_all();
+
+    int job_count = 0;
+    GList *l = backup_state.bcb_list;
+    while (l) {
+        BackupCB *bcb = l->data;
+        l = g_list_next(l);
+        BlockJob *job = bcb->bs->job;
+        if (job) {
+            job_count++;
+            if (!bcb->started) {
+                bcb->started = true;
+                backup_job_start(bcb->bs, true);
+            }
+            if (!bcb->completed) {
+                block_job_cancel_sync(job);
+            }
+        }
+    }
+
+    backup_cleanup();
+}
+
+void qmp_backup_cancel(Error **errp)
+{
+    backup_cancel();
+}
+
+static void backup_run_next_job(void)
+{
+    GList *l = backup_state.bcb_list;
+    while (l) {
+        BackupCB *bcb = l->data;
+        l = g_list_next(l);
+
+        if (bcb->bs && bcb->bs->job && !bcb->completed) {
+            if (!bcb->started) {
+                bcb->started = true;
+                bool cancel = backup_state.error || backup_state.cancel;
+                backup_job_start(bcb->bs, cancel);
+            }
+            return;
+        }
+    }
+
+    backup_cleanup();
+}
+
+static void backup_start_jobs(void)
+{
+    /* create all jobs (one for each device), start first one */
+    GList *l = backup_state.bcb_list;
+    while (l) {
+        BackupCB *bcb = l->data;
+        l = g_list_next(l);
+
+        if (backup_job_create(bcb->bs, backup_dump_cb, backup_complete_cb,
+                              bcb, backup_state.speed) != 0) {
+            error_setg(&backup_state.error, "backup_job_create failed");
+            backup_cancel();
+            return;
+        }
+    }
+
+    backup_run_next_job();
+}
+
+char *qmp_backup(const char *backup_file, bool has_format, BackupFormat format,
+                 bool has_config_file, const char *config_file,
+                 bool has_devlist, const char *devlist,
+                 bool has_speed, int64_t speed, Error **errp)
+{
+    BlockDriverState *bs;
+    Error *local_err = NULL;
+    uuid_t uuid;
+    void *writer = NULL;
+    gchar **devs = NULL;
+    GList *bcblist = NULL;
+
+    if (backup_state.bcb_list) {
+        error_set(errp, ERROR_CLASS_GENERIC_ERROR,
+                  "previous backup not finished");
+        return NULL;
+    }
+
+    /* Todo: try to auto-detect format based on file name */
+    format = has_format ? format : BACKUP_FORMAT_VMA;
+
+    /* fixme: find driver for specifued format */
+    const BackupDriver *driver = NULL;
+
+    if (!driver) {
+        error_set(errp, ERROR_CLASS_GENERIC_ERROR, "unknown backup format");
+        return NULL;
+    }
+
+    if (has_devlist) {
+        devs = g_strsplit_set(devlist, ",;:", -1);
+
+        gchar **d = devs;
+        while (d && *d) {
+            bs = bdrv_find(*d);
+            if (bs) {
+                if (bdrv_is_read_only(bs)) {
+                    error_set(errp, QERR_DEVICE_IS_READ_ONLY, *d);
+                    goto err;
+                }
+                if (!bdrv_is_inserted(bs)) {
+                    error_set(errp, QERR_DEVICE_HAS_NO_MEDIUM, *d);
+                    goto err;
+                }
+                BackupCB *bcb = g_new0(BackupCB, 1);
+                bcb->bs = bs;
+                bcblist = g_list_append(bcblist, bcb);
+            } else {
+                error_set(errp, QERR_DEVICE_NOT_FOUND, *d);
+                goto err;
+            }
+            d++;
+        }
+
+    } else {
+
+        bs = NULL;
+        while ((bs = bdrv_next(bs))) {
+
+            if (!bdrv_is_inserted(bs) || bdrv_is_read_only(bs)) {
+                continue;
+            }
+
+            BackupCB *bcb = g_new0(BackupCB, 1);
+            bcb->bs = bs;
+            bcblist = g_list_append(bcblist, bcb);
+        }
+    }
+
+    if (!bcblist) {
+        error_set(errp, ERROR_CLASS_GENERIC_ERROR, "empty device list");
+        goto err;
+    }
+
+    GList *l = bcblist;
+    while (l) {
+        BackupCB *bcb = l->data;
+        l = g_list_next(l);
+        if (bcb->bs->job) {
+            error_set(errp, QERR_DEVICE_IN_USE, bdrv_get_device_name(bcb->bs));
+            goto err;
+        }
+    }
+
+    uuid_generate(uuid);
+
+    writer = driver->open(backup_file, uuid, &local_err);
+    if (!writer) {
+        if (error_is_set(&local_err)) {
+            error_propagate(errp, local_err);
+        }
+        goto err;
+    }
+
+    size_t total = 0;
+
+    /* register all devices for vma writer */
+    l = bcblist;
+    while (l) {
+        BackupCB *bcb = l->data;
+        l = g_list_next(l);
+
+        int64_t size = bdrv_getlength(bcb->bs);
+        const char *devname = bdrv_get_device_name(bcb->bs);
+        bcb->dev_id = driver->register_stream(writer, devname, size);
+        if (bcb->dev_id <= 0) {
+            error_set(errp, ERROR_CLASS_GENERIC_ERROR,
+                      "register_stream failed");
+            goto err;
+        }
+        bcb->size = size;
+        total += size;
+    }
+
+    /* add configuration file to archive */
+    if (has_config_file) {
+        char *cdata = NULL;
+        gsize clen = 0;
+        GError *err = NULL;
+        if (!g_file_get_contents(config_file, &cdata, &clen, &err)) {
+            error_setg(errp, "unable to read file '%s'", config_file);
+            goto err;
+        }
+
+        const char *basename = g_path_get_basename(config_file);
+        if (driver->register_config(writer, basename, cdata, clen) < 0) {
+            error_setg(errp, "register_config failed");
+            g_free(cdata);
+            goto err;
+        }
+        g_free(cdata);
+    }
+
+    /* initialize global backup_state now */
+
+    backup_state.cancel = false;
+
+    if (backup_state.error) {
+        error_free(backup_state.error);
+        backup_state.error = NULL;
+    }
+
+    backup_state.driver = driver;
+
+    backup_state.speed = (has_speed && speed > 0) ? speed : 0;
+
+    backup_state.start_time = time(NULL);
+    backup_state.end_time = 0;
+
+    if (backup_state.backup_file) {
+        g_free(backup_state.backup_file);
+    }
+    backup_state.backup_file = g_strdup(backup_file);
+
+    backup_state.writer = writer;
+
+    uuid_copy(backup_state.uuid, uuid);
+    uuid_unparse_lower(uuid, backup_state.uuid_str);
+
+    backup_state.bcb_list = bcblist;
+
+    backup_state.total = total;
+    backup_state.transferred = 0;
+    backup_state.zero_bytes = 0;
+
+    /* Grab a reference so hotplug does not delete the
+     * BlockDriverState from underneath us.
+     */
+    l = bcblist;
+    while (l) {
+        BackupCB *bcb = l->data;
+        l = g_list_next(l);
+        drive_get_ref(drive_get_by_blockdev(bcb->bs));
+    }
+
+    backup_start_jobs();
+
+    return g_strdup(backup_state.uuid_str);
+
+err:
+
+    l = bcblist;
+    while (l) {
+        g_free(l->data);
+        l = g_list_next(l);
+    }
+    g_list_free(bcblist);
+
+    if (devs) {
+        g_strfreev(devs);
+    }
+
+    if (writer) {
+        unlink(backup_file);
+        if (driver) {
+            Error *err = NULL;
+            driver->close(writer, &err);
+        }
+    }
+
+    return NULL;
+}
+
+BackupStatus *qmp_query_backup(Error **errp)
+{
+    BackupStatus *info = g_malloc0(sizeof(*info));
+
+    if (!backup_state.start_time) {
+        /* not started, return {} */
+        return info;
+    }
+
+    info->has_status = true;
+    info->has_start_time = true;
+    info->start_time = backup_state.start_time;
+
+    if (backup_state.backup_file) {
+        info->has_backup_file = true;
+        info->backup_file = g_strdup(backup_state.backup_file);
+    }
+
+    info->has_uuid = true;
+    info->uuid = g_strdup(backup_state.uuid_str);
+
+    if (backup_state.end_time) {
+        if (backup_state.error) {
+            info->status = g_strdup("error");
+            info->has_errmsg = true;
+            info->errmsg = g_strdup(error_get_pretty(backup_state.error));
+        } else {
+            info->status = g_strdup("done");
+        }
+        info->has_end_time = true;
+        info->end_time = backup_state.end_time;
+    } else {
+        info->status = g_strdup("active");
+    }
+
+    info->has_total = true;
+    info->total = backup_state.total;
+    info->has_zero_bytes = true;
+    info->zero_bytes = backup_state.zero_bytes;
+    info->has_transferred = true;
+    info->transferred = backup_state.transferred;
+
+    return info;
 }
 
 static BlockJob *find_block_job(const char *device)

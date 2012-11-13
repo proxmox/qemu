@@ -131,6 +131,38 @@ void hmp_info_mice(Monitor *mon, const QDict *qdict)
     qapi_free_MouseInfoList(mice_list);
 }
 
+void hmp_info_backup(Monitor *mon, const QDict *qdict)
+{
+    BackupStatus *info;
+
+    info = qmp_query_backup(NULL);
+    if (info->has_status) {
+        if (info->has_errmsg) {
+            monitor_printf(mon, "Backup status: %s - %s\n",
+                           info->status, info->errmsg);
+        } else {
+            monitor_printf(mon, "Backup status: %s\n", info->status);
+        }
+    }
+    if (info->has_backup_file) {
+        int per = (info->has_total && info->total &&
+            info->has_transferred && info->transferred) ?
+            (info->transferred * 100)/info->total : 0;
+        int zero_per = (info->has_total && info->total &&
+                        info->has_zero_bytes && info->zero_bytes) ?
+            (info->zero_bytes * 100)/info->total : 0;
+        monitor_printf(mon, "Backup file: %s\n", info->backup_file);
+        monitor_printf(mon, "Backup uuid: %s\n", info->uuid);
+        monitor_printf(mon, "Total size: %zd\n", info->total);
+        monitor_printf(mon, "Transferred bytes: %zd (%d%%)\n",
+                       info->transferred, per);
+        monitor_printf(mon, "Zero bytes: %zd (%d%%)\n",
+                       info->zero_bytes, zero_per);
+    }
+
+    qapi_free_BackupStatus(info);
+}
+
 void hmp_info_migrate(Monitor *mon, const QDict *qdict)
 {
     MigrationInfo *info;
@@ -996,6 +1028,37 @@ void hmp_block_stream(Monitor *mon, const QDict *qdict)
                      BLOCKDEV_ON_ERROR_REPORT, true, &error);
 
     hmp_handle_error(mon, &error);
+}
+
+void hmp_backup_cancel(Monitor *mon, const QDict *qdict)
+{
+    Error *errp = NULL;
+
+    qmp_backup_cancel(&errp);
+
+    if (error_is_set(&errp)) {
+        monitor_printf(mon, "%s\n", error_get_pretty(errp));
+        error_free(errp);
+        return;
+    }
+}
+
+void hmp_backup(Monitor *mon, const QDict *qdict)
+{
+    const char *backup_file = qdict_get_str(qdict, "backup-file");
+    const char *devlist = qdict_get_try_str(qdict, "devlist");
+    int64_t speed = qdict_get_try_int(qdict, "speed", 0);
+
+    Error *errp = NULL;
+
+    qmp_backup(backup_file, true, BACKUP_FORMAT_VMA, false, NULL, !!devlist,
+               devlist, qdict_haskey(qdict, "speed"), speed, &errp);
+
+    if (error_is_set(&errp)) {
+        monitor_printf(mon, "%s\n", error_get_pretty(errp));
+        error_free(errp);
+        return;
+    }
 }
 
 void hmp_block_job_set_speed(Monitor *mon, const QDict *qdict)
