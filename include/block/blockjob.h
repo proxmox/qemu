@@ -50,6 +50,13 @@ typedef struct BlockJobType {
      * manually.
      */
     void (*complete)(BlockJob *job, Error **errp);
+
+    /** tracked requests */
+    int coroutine_fn (*before_read)(BlockDriverState *bs, int64_t sector_num,
+                                    int nb_sectors, QEMUIOVector *qiov);
+    int coroutine_fn (*before_write)(BlockDriverState *bs, int64_t sector_num,
+                                     int nb_sectors, QEMUIOVector *qiov);
+
 } BlockJobType;
 
 /**
@@ -102,6 +109,9 @@ struct BlockJob {
 
     /** Speed that was set with @block_job_set_speed.  */
     int64_t speed;
+
+    /** tracked requests */
+    int cluster_size;
 
     /** The completion function that will be called when the job completes.  */
     BlockDriverCompletionFunc *cb;
