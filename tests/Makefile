@@ -59,6 +59,8 @@ gcov-files-test-mul64-y = util/host-utils.c
 
 check-block-$(CONFIG_POSIX) += tests/qemu-iotests-quick.sh
 
+check-backup-y = tests/backup-test$(EXESUF)
+
 # All QTests for now are POSIX-only, but the dependencies are
 # really in libqtest, not in the testcases themselves.
 check-qtest-i386-y = tests/fdc-test$(EXESUF)
@@ -102,6 +104,7 @@ tests/test-coroutine$(EXESUF): tests/test-coroutine.o $(block-obj-y) libqemuutil
 tests/test-aio$(EXESUF): tests/test-aio.o $(block-obj-y) libqemuutil.a libqemustub.a
 tests/test-thread-pool$(EXESUF): tests/test-thread-pool.o $(block-obj-y) libqemuutil.a libqemustub.a
 tests/test-iov$(EXESUF): tests/test-iov.o libqemuutil.a
+tests/backup-test$(EXESUF): tests/backup-test.o vma-reader.o $(block-obj-y) libqemuutil.a libqemustub.a
 tests/test-hbitmap$(EXESUF): tests/test-hbitmap.o libqemuutil.a libqemustub.a
 tests/test-x86-cpuid$(EXESUF): tests/test-x86-cpuid.o
 tests/test-xbzrle$(EXESUF): tests/test-xbzrle.o xbzrle.o page_cache.o libqemuutil.a
@@ -213,10 +216,14 @@ check-tests/qemu-iotests-quick.sh: tests/qemu-iotests-quick.sh qemu-img$(EXESUF)
 
 # Consolidated targets
 
-.PHONY: check-qtest check-unit check
+.PHONY: check-backup check-qtest check-unit check
 check-qtest: $(patsubst %,check-qtest-%, $(QTEST_TARGETS))
 check-unit: $(patsubst %,check-%, $(check-unit-y))
 check-block: $(patsubst %,check-%, $(check-block-y))
-check: check-unit check-qtest
+
+check-backup: tests/backup-test$(EXESUF)
+	$<
+
+check: check-unit check-qtest check-backup
 
 -include $(wildcard tests/*.d)
