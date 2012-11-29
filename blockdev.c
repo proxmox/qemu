@@ -22,6 +22,8 @@
 #include "sysemu/arch_init.h"
 #include "backup.h"
 #include "vma.h"
+#include "migration/qemu-file.h"
+#include "migration/migration.h"
 
 static QTAILQ_HEAD(drivelist, DriveInfo) drives = QTAILQ_HEAD_INITIALIZER(drives);
 
@@ -1355,6 +1357,10 @@ static struct GenericBackupState {
     size_t total;
     size_t transferred;
     size_t zero_bytes;
+    unsigned char buf[BACKUP_CLUSTER_SIZE];
+    int buf_index;
+    size_t buf_cluster_num;
+    guint8 vmstate_dev_id;
 } backup_state;
 
 typedef struct BackupCB {
@@ -1510,10 +1516,170 @@ static void backup_start_jobs(void)
     backup_run_next_job();
 }
 
+static int backup_state_close(void *opaque)
+{
+    if (!backup_state.buf_index) {
+        return 0;
+    }
+
+    size_t zero_bytes = 0;
+    if (backup_state.buf_index < BACKUP_CLUSTER_SIZE) {
+        memset(backup_state.buf + backup_state.buf_index, 0,
+               BACKUP_CLUSTER_SIZE - backup_state.buf_index);
+    }
+    int bytes = backup_state.driver->dump(
+        backup_state.writer, backup_state.vmstate_dev_id,
+        backup_state.buf_cluster_num,
+        backup_state.buf, &zero_bytes);
+    backup_state.buf_index = 0;
+
+    return bytes < 0 ? -1 : 0;
+}
+
+static int backup_state_put_buffer(void *opaque, const uint8_t *buf,
+                                   int64_t pos, int size)
+{
+    assert(backup_state.driver);
+    assert(backup_state.writer);
+    assert(backup_state.driver->dump);
+
+    /* Note: our backup driver expects to get whole clusters (64KB) */
+
+    int ret = size;
+
+    while (size > 0) {
+        int l = BACKUP_CLUSTER_SIZE - backup_state.buf_index;
+        l = l > size ? size : l;
+        memcpy(backup_state.buf + backup_state.buf_index, buf, l);
+        backup_state.buf_index += l;
+        buf += l;
+        size -= l;
+        if (backup_state.buf_index == BACKUP_CLUSTER_SIZE) {
+            size_t zero_bytes = 0;
+            int bytes = backup_state.driver->dump(
+                backup_state.writer, backup_state.vmstate_dev_id,
+                backup_state.buf_cluster_num++,
+                backup_state.buf, &zero_bytes);
+            backup_state.buf_index = 0;
+            if (bytes < 0) {
+                return -1;
+            }
+        }
+    }
+
+    return ret;
+}
+
+static const QEMUFileOps backup_file_ops = {
+    .put_buffer = backup_state_put_buffer,
+    .close = backup_state_close,
+};
+
+static void coroutine_fn backup_start_savevm(void *opaque)
+{
+    assert(backup_state.driver);
+    assert(backup_state.writer);
+    int ret;
+    char *err = NULL;
+    uint64_t remaining;
+    int64_t maxlen;
+    MigrationParams params = {
+        .blk = 0,
+        .shared = 0
+    };
+
+    int restart = 0;
+
+    QEMUFile *file = qemu_fopen_ops(NULL, &backup_file_ops);
+
+    ret = qemu_savevm_state_begin(file, &params);
+    if (ret < 0) {
+        qemu_fclose(file);
+        err = g_strdup("qemu_savevm_state_begin failed");
+        goto abort;
+    }
+
+    while (1) {
+        ret = qemu_savevm_state_iterate(file);
+        remaining = ram_bytes_remaining();
+
+        if (ret < 0) {
+            qemu_fclose(file);
+            err = g_strdup_printf("qemu_savevm_state_iterate error %d", ret);
+            goto abort;
+        }
+
+        /* stop the VM if we use too much space,
+         * or if remaining is just a few MB
+         */
+        maxlen = ram_bytes_total();
+        size_t cpos = backup_state.buf_cluster_num * BACKUP_CLUSTER_SIZE;
+        if ((remaining < 100000) || ((cpos + remaining) >= maxlen)) {
+            if (runstate_is_running()) {
+                restart = 1;
+                vm_stop(RUN_STATE_SAVE_VM);
+           }
+        }
+
+        if (ret == 1) { /* finished */
+            if (runstate_is_running()) {
+                restart = 1;
+                vm_stop(RUN_STATE_SAVE_VM);
+            }
+
+            ret = qemu_savevm_state_complete(file);
+            if (ret < 0) {
+                qemu_fclose(file);
+                err = g_strdup("qemu_savevm_state_complete error");
+                goto abort;
+
+            } else {
+                if (qemu_fclose(file) < 0) {
+                    error_setg(&backup_state.error,
+                               "backup_start_savevm: qemu_fclose failed");
+                    goto abort;
+                }
+                if (backup_state.driver->complete(backup_state.writer,
+                    backup_state.vmstate_dev_id, 0) < 0) {
+                    err = g_strdup("backup_start_savevm: complete failed");
+                    goto abort;
+                }
+                backup_run_next_job();
+                goto out;
+            }
+        }
+    }
+
+out:
+    if (restart) {
+        vm_start();
+    }
+    return;
+
+abort:
+    backup_state.end_time = time(NULL);
+
+    Error *local_err = NULL;
+    backup_state.driver->close(backup_state.writer, &local_err);
+    backup_state.writer = NULL;
+
+    error_propagate(&backup_state.error, local_err);
+
+    if (err) {
+        if (!backup_state.error) {
+            error_setg(&backup_state.error, "%s", err);
+        }
+        g_free(err);
+    }
+
+    goto out;
+}
+
 char *qmp_backup(const char *backup_file, bool has_format, BackupFormat format,
                  bool has_config_file, const char *config_file,
                  bool has_devlist, const char *devlist,
-                 bool has_speed, int64_t speed, Error **errp)
+                 bool has_speed, int64_t speed,
+                 bool has_state, bool state, Error **errp)
 {
     BlockDriverState *bs;
     Error *local_err = NULL;
@@ -1527,6 +1693,8 @@ char *qmp_backup(const char *backup_file, bool has_format, BackupFormat format,
                   "previous backup not finished");
         return NULL;
     }
+
+    bool save_state = has_state ? state : false;
 
     /* Todo: try to auto-detect format based on file name */
     format = has_format ? format : BACKUP_FORMAT_VMA;
@@ -1608,6 +1776,22 @@ char *qmp_backup(const char *backup_file, bool has_format, BackupFormat format,
     size_t total = 0;
 
     /* register all devices for vma writer */
+
+    guint8 vmstate_dev_id = 0;
+    if (save_state) {
+        /* Note: we pass ram_bytes_total() for vmstate size
+         * The backup driver needs to be aware of the fact
+         * that the real stream size can be different (we do
+         * not know that size in advance).
+         */
+        size_t ramsize = ram_bytes_total();
+        vmstate_dev_id = driver->register_stream(writer, "vmstate", ramsize);
+        if (vmstate_dev_id <= 0) {
+            error_setg(errp, "register vmstate stream failed");
+            goto err;
+        }
+    }
+
     l = bcblist;
     while (l) {
         BackupCB *bcb = l->data;
@@ -1675,6 +1859,9 @@ char *qmp_backup(const char *backup_file, bool has_format, BackupFormat format,
     backup_state.total = total;
     backup_state.transferred = 0;
     backup_state.zero_bytes = 0;
+    backup_state.buf_index = 0;
+    backup_state.buf_cluster_num = 0;
+    backup_state.vmstate_dev_id = vmstate_dev_id;
 
     /* Grab a reference so hotplug does not delete the
      * BlockDriverState from underneath us.
@@ -1686,7 +1873,12 @@ char *qmp_backup(const char *backup_file, bool has_format, BackupFormat format,
         drive_get_ref(drive_get_by_blockdev(bcb->bs));
     }
 
-    backup_start_jobs();
+    if (save_state) {
+        Coroutine *co = qemu_coroutine_create(backup_start_savevm);
+        qemu_coroutine_enter(co, NULL);
+    } else {
+        backup_start_jobs();
+    }
 
     return g_strdup(backup_state.uuid_str);
 

@@ -1052,7 +1052,8 @@ void hmp_backup(Monitor *mon, const QDict *qdict)
     Error *errp = NULL;
 
     qmp_backup(backup_file, true, BACKUP_FORMAT_VMA, false, NULL, !!devlist,
-               devlist, qdict_haskey(qdict, "speed"), speed, &errp);
+               devlist, qdict_haskey(qdict, "speed"), speed, false, false,
+               &errp);
 
     if (error_is_set(&errp)) {
         monitor_printf(mon, "%s\n", error_get_pretty(errp));

@@ -1885,6 +1885,8 @@
 # @devlist: #optional list of block device names (separated by ',', ';'
 # or ':'). By default the backup includes all writable block devices.
 #
+# @state: #optional flag to include vm state
+#
 # Returns: the uuid of the backup job
 #
 # Since: 1.5.0
@@ -1892,7 +1894,8 @@
 { 'command': 'backup', 'data': { 'backup-file': 'str',
                                  '*format': 'BackupFormat',
                                  '*config-file': 'str',
-                                 '*devlist': 'str', '*speed': 'int' },
+                                 '*devlist': 'str', '*speed': 'int',
+                                 '*state': 'bool' },
   'returns': 'str' }
 
 ##
