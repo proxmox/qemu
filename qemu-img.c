@@ -661,11 +661,12 @@ static int compare_sectors(const uint8_t *buf1, const uint8_t *buf2, int n,
     return res;
 }
 
-#define IO_BUF_SIZE (2 * 1024 * 1024)
+//#define IO_BUF_SIZE (2 * 1024 * 1024)
+#define IO_BUF_SIZE (64 * 1024)
 
 static int img_convert(int argc, char **argv)
 {
-    int c, ret = 0, n, n1, bs_n, bs_i, compress, cluster_size, cluster_sectors;
+    int c, ret = 0, n, n1, bs_n, bs_i, compress, cluster_size, cluster_sectors, skipcreate;
     int progress = 0, flags;
     const char *fmt, *out_fmt, *cache, *out_baseimg, *out_filename;
     BlockDriver *drv, *proto_drv;
@@ -687,8 +688,9 @@ static int img_convert(int argc, char **argv)
     cache = "unsafe";
     out_baseimg = NULL;
     compress = 0;
+    skipcreate = 0;
     for(;;) {
-        c = getopt(argc, argv, "f:O:B:s:hce6o:pS:t:");
+        c = getopt(argc, argv, "f:O:B:s:hcCe6o:pS:t:");
         if (c == -1) {
             break;
         }
@@ -708,6 +710,9 @@ static int img_convert(int argc, char **argv)
             break;
         case 'c':
             compress = 1;
+            break;
+        case 'C':
+            skipcreate = 1;
             break;
         case 'e':
             error_report("option -e is deprecated, please use \'-o "
@@ -869,20 +874,22 @@ static int img_convert(int argc, char **argv)
         }
     }
 
-    /* Create the new image */
-    ret = bdrv_create(drv, out_filename, param);
-    if (ret < 0) {
-        if (ret == -ENOTSUP) {
-            error_report("Formatting not supported for file format '%s'",
-                         out_fmt);
-        } else if (ret == -EFBIG) {
-            error_report("The image size is too large for file format '%s'",
-                         out_fmt);
-        } else {
-            error_report("%s: error while converting %s: %s",
-                         out_filename, out_fmt, strerror(-ret));
+    if (!skipcreate) {
+        /* Create the new image */
+        ret = bdrv_create(drv, out_filename, param);
+        if (ret < 0) {
+            if (ret == -ENOTSUP) {
+                 error_report("Formatting not supported for file format '%s'",
+                              out_fmt);
+            } else if (ret == -EFBIG) {
+                 error_report("The image size is too large for file format '%s'",
+                              out_fmt);
+            } else {
+                error_report("%s: error while converting %s: %s",
+                             out_filename, out_fmt, strerror(-ret));
+            }
+            goto out;
         }
-        goto out;
     }
 
     flags = BDRV_O_RDWR;
@@ -990,7 +997,9 @@ static int img_convert(int argc, char **argv)
         bdrv_write_compressed(out_bs, 0, NULL, 0);
     } else {
         int has_zero_init = bdrv_has_zero_init(out_bs);
-
+        
+        has_zero_init = 0; //fixme_ olny for testing
+ 
         sector_num = 0; // total number of sectors converted so far
         nb_sectors = total_sectors - sector_num;
         if (nb_sectors != 0) {
