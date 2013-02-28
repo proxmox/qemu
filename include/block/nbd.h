@@ -78,6 +78,14 @@ int nbd_disconnect(int fd);
 typedef struct NBDExport NBDExport;
 typedef struct NBDClient NBDClient;
 
+typedef int (*NBDWriteFunc)(void *opaque, int64_t sector_num,
+                            const uint8_t *buf, int nb_sectors);
+
+NBDExport *nbd_export2_new(off_t size, uint32_t nbdflags,
+                           NBDWriteFunc write_cb,
+                           void *opaque,
+                           void (*close)(NBDExport *));
+
 NBDExport *nbd_export_new(BlockDriverState *bs, off_t dev_offset,
                           off_t size, uint32_t nbdflags,
                           void (*close)(NBDExport *));

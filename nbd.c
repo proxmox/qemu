@@ -91,7 +91,8 @@ struct NBDRequest {
 struct NBDExport {
     int refcount;
     void (*close)(NBDExport *exp);
-
+    NBDWriteFunc write_cb;
+    void *opaque;
     BlockDriverState *bs;
     char *name;
     off_t dev_offset;
@@ -448,7 +449,7 @@ int nbd_receive_negotiate(int csock, const char *name, uint32_t *flags,
     uint16_t tmp;
     int rc;
 
-    TRACE("Receiving negotiation.");
+    TRACE("Receiving negotiation. name = %s", name);
 
     socket_set_block(csock);
     rc = -EINVAL;
@@ -879,6 +880,25 @@ static void nbd_request_put(NBDRequest *req)
     nbd_client_put(client);
 }
 
+NBDExport *nbd_export2_new(off_t size, uint32_t nbdflags,
+                           NBDWriteFunc write_cb,
+                           void *opaque,
+                           void (*close)(NBDExport *))
+{
+    NBDExport *exp = g_malloc0(sizeof(NBDExport));
+    QSIMPLEQ_INIT(&exp->requests);
+    exp->refcount = 1;
+    QTAILQ_INIT(&exp->clients);
+    exp->bs = NULL;
+    exp->dev_offset = 0;
+    exp->nbdflags = nbdflags;
+    exp->size = size;
+    exp->close = close;
+    exp->write_cb = write_cb;
+    exp->opaque = opaque;
+    return exp;
+}
+
 NBDExport *nbd_export_new(BlockDriverState *bs, off_t dev_offset,
                           off_t size, uint32_t nbdflags,
                           void (*close)(NBDExport *))
@@ -1143,9 +1163,15 @@ static void nbd_trip(void *opaque)
         }
 
         TRACE("Writing to device");
-
-        ret = bdrv_write(exp->bs, (request.from + exp->dev_offset) / 512,
-                         req->data, request.len / 512);
+        
+        if (exp->write_cb) {
+            ret = exp->write_cb(exp->opaque, 
+                                (request.from + exp->dev_offset) / 512,
+                                req->data, request.len / 512);
+        } else {
+            ret = bdrv_write(exp->bs, (request.from + exp->dev_offset) / 512,
+                             req->data, request.len / 512);
+        }
         if (ret < 0) {
             LOG("writing to file failed");
             reply.error = -ret;
