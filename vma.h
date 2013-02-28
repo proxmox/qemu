@@ -122,7 +122,8 @@ int vma_writer_register_stream(VmaWriter *vmaw, const char *devname,
                                size_t size);
 
 int64_t coroutine_fn vma_writer_write(VmaWriter *vmaw, uint8_t dev_id,
-                                      int64_t cluster_num, unsigned char *buf,
+                                      int64_t cluster_num, 
+                                      const unsigned char *buf,
                                       size_t *zero_bytes);
 
 int coroutine_fn vma_writer_close_stream(VmaWriter *vmaw, uint8_t dev_id);

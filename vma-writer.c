@@ -690,7 +690,7 @@ static int vma_writer_get_buffer(VmaWriter *vmaw)
 
 int64_t coroutine_fn
 vma_writer_write(VmaWriter *vmaw, uint8_t dev_id, int64_t cluster_num,
-                 unsigned char *buf, size_t *zero_bytes)
+                 const unsigned char *buf, size_t *zero_bytes)
 {
     g_assert(vmaw != NULL);
     g_assert(zero_bytes != NULL);
@@ -746,7 +746,7 @@ vma_writer_write(VmaWriter *vmaw, uint8_t dev_id, int64_t cluster_num,
         int i;
         int bit = 1;
         for (i = 0; i < 16; i++) {
-            unsigned char *vmablock = buf + (i*VMA_BLOCK_SIZE);
+            const unsigned char *vmablock = buf + (i*VMA_BLOCK_SIZE);
             if (!buffer_is_zero(vmablock, VMA_BLOCK_SIZE)) {
                 mask |= bit;
                 memcpy(vmaw->outbuf + vmaw->outbuf_pos, vmablock,
