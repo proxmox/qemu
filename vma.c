@@ -33,7 +33,8 @@ static void help(void)
         "\n"
         "vma list <filename>\n"
         "vma create <filename> [-c config] <archive> pathname ...\n"
-        "vma extract <filename> [-r] <targetdir>\n"
+        "vma extract <filename> [-v] [-r] <targetdir>\n"
+        "vma verify <filename> [-v]\n"
         ;
 
     printf("%s", help_msg);
@@ -337,6 +338,58 @@ static int extract_content(int argc, char **argv)
     return ret;
 }
 
+static int verify_content(int argc, char **argv)
+{
+    int c, ret = 0;
+    int verbose = 0;
+    const char *filename;
+
+    for (;;) {
+        c = getopt(argc, argv, "hv");
+        if (c == -1) {
+            break;
+        }
+        switch (c) {
+        case '?':
+        case 'h':
+            help();
+            break;
+        case 'v':
+            verbose = 1;
+            break;
+        default:
+            help();
+        }
+    }
+
+    /* Get the filename */
+    if ((optind + 1) != argc) {
+        help();
+    }
+    filename = argv[optind++];
+
+    Error *errp = NULL;
+    VmaReader *vmar = vma_reader_create(filename, &errp);
+
+    if (!vmar) {
+        g_error("%s", error_get_pretty(errp));
+    }
+
+    if (verbose) {
+        print_content(vmar);
+    }
+
+    if (vma_reader_verify(vmar, verbose, &errp) < 0) {
+        g_error("verify failed - %s", error_get_pretty(errp));
+    }
+
+    vma_reader_destroy(vmar);
+
+    bdrv_close_all();
+
+    return ret;
+}
+
 typedef struct BackupCB {
     VmaWriter *vmaw;
     uint8_t dev_id;
@@ -554,6 +607,8 @@ int main(int argc, char **argv)
         return create_archive(argc, argv);
     } else if (!strcmp(cmdname, "extract")) {
         return extract_content(argc, argv);
+    } else if (!strcmp(cmdname, "verify")) {
+        return verify_content(argc, argv);
     }
 
     help();

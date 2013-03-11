@@ -141,5 +141,6 @@ int vma_reader_register_bs(VmaReader *vmar, guint8 dev_id,
                            Error **errp);
 int vma_reader_restore(VmaReader *vmar, int vmstate_fd, bool verbose,
                        Error **errp);
+int vma_reader_verify(VmaReader *vmar, bool verbose, Error **errp);
 
 #endif /* BACKUP_VMA_H */

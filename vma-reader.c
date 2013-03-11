@@ -53,6 +53,8 @@ struct VmaReader {
     time_t start_time;
     int64_t cluster_count;
     int64_t clusters_read;
+    int64_t zero_cluster_data;
+    int64_t partial_zero_cluster_data;
     int clusters_read_per;
 };
 
@@ -433,6 +435,27 @@ VmaDeviceInfo *vma_reader_get_device_info(VmaReader *vmar, guint8 dev_id)
     return NULL;
 }
 
+static void allocate_rstate(VmaReader *vmar,  guint8 dev_id, 
+                            BlockDriverState *bs, bool write_zeroes)
+{
+    assert(vmar);
+    assert(dev_id);
+
+    vmar->rstate[dev_id].bs = bs;
+    vmar->rstate[dev_id].write_zeroes = write_zeroes;
+
+    int64_t size = vmar->devinfo[dev_id].size;
+
+    int64_t bitmap_size = (size/BDRV_SECTOR_SIZE) +
+        (VMA_CLUSTER_SIZE/BDRV_SECTOR_SIZE) * BITS_PER_LONG - 1;
+    bitmap_size /= (VMA_CLUSTER_SIZE/BDRV_SECTOR_SIZE) * BITS_PER_LONG;
+
+    vmar->rstate[dev_id].bitmap_size = bitmap_size;
+    vmar->rstate[dev_id].bitmap = g_new0(unsigned long, bitmap_size);
+
+    vmar->cluster_count += size/VMA_CLUSTER_SIZE;
+}
+
 int vma_reader_register_bs(VmaReader *vmar, guint8 dev_id, BlockDriverState *bs,
                            bool write_zeroes, Error **errp)
 {
@@ -449,17 +472,7 @@ int vma_reader_register_bs(VmaReader *vmar, guint8 dev_id, BlockDriverState *bs,
         return -1;
     }
 
-    vmar->rstate[dev_id].bs = bs;
-    vmar->rstate[dev_id].write_zeroes = write_zeroes;
-
-    int64_t bitmap_size = (size/BDRV_SECTOR_SIZE) +
-        (VMA_CLUSTER_SIZE/BDRV_SECTOR_SIZE) * BITS_PER_LONG - 1;
-    bitmap_size /= (VMA_CLUSTER_SIZE/BDRV_SECTOR_SIZE) * BITS_PER_LONG;
-
-    vmar->rstate[dev_id].bitmap_size = bitmap_size;
-    vmar->rstate[dev_id].bitmap = g_new0(unsigned long, bitmap_size);
-
-    vmar->cluster_count += size/VMA_CLUSTER_SIZE;
+    allocate_rstate(vmar, dev_id, bs, write_zeroes);
 
     return 0;
 }
@@ -526,9 +539,10 @@ static int restore_write_data(VmaReader *vmar, guint8 dev_id,
     }
     return 0;
 }
+
 static int restore_extent(VmaReader *vmar, unsigned char *buf,
                           int extent_size, int vmstate_fd,
-                          bool verbose, Error **errp)
+                          bool verbose, bool verify, Error **errp)
 {
     assert(vmar);
     assert(buf);
@@ -553,7 +567,7 @@ static int restore_extent(VmaReader *vmar, unsigned char *buf,
 
         if (dev_id != vmar->vmstate_stream) {
             bs = rstate->bs;
-            if (!bs) {
+            if (!verify && !bs) {
                 error_setg(errp, "got wrong dev id %d", dev_id);
                 return -1;
             }
@@ -609,10 +623,13 @@ static int restore_extent(VmaReader *vmar, unsigned char *buf,
                 return -1;
             }
 
-            int nb_sectors = end_sector - sector_num;
-            if (restore_write_data(vmar, dev_id, bs, vmstate_fd, buf + start,
-                                   sector_num, nb_sectors, errp) < 0) {
-                return -1;
+            if (!verify) {
+                int nb_sectors = end_sector - sector_num;
+                if (restore_write_data(vmar, dev_id, bs, vmstate_fd, 
+                                       buf + start, sector_num, nb_sectors, 
+                                       errp) < 0) {
+                    return -1;
+                }
             }
 
             start += VMA_CLUSTER_SIZE;
@@ -642,26 +659,37 @@ static int restore_extent(VmaReader *vmar, unsigned char *buf,
                         return -1;
                     }
 
-                    int nb_sectors = end_sector - sector_num;
-                    if (restore_write_data(vmar, dev_id, bs, vmstate_fd,
-                                           buf + start, sector_num,
-                                           nb_sectors, errp) < 0) {
-                        return -1;
+                    if (!verify) {
+                        int nb_sectors = end_sector - sector_num;
+                        if (restore_write_data(vmar, dev_id, bs, vmstate_fd,
+                                               buf + start, sector_num,
+                                               nb_sectors, errp) < 0) {
+                            return -1;
+                        }
                     }
 
                     start += VMA_BLOCK_SIZE;
 
                 } else {
 
-                    if (rstate->write_zeroes && (end_sector > sector_num)) {
+ 
+                    if (end_sector > sector_num) {
                         /* Todo: use bdrv_co_write_zeroes (but that need to
                          * be run inside coroutine?)
                          */
                         int nb_sectors = end_sector - sector_num;
-                        if (restore_write_data(vmar, dev_id, bs, vmstate_fd,
-                                              zero_vma_block, sector_num,
-                                               nb_sectors, errp) < 0) {
-                            return -1;
+                        int zero_size = BDRV_SECTOR_SIZE*nb_sectors;
+                        vmar->zero_cluster_data += zero_size;
+                        if (mask != 0) {
+                            vmar->partial_zero_cluster_data += zero_size;
+                        }
+
+                        if (rstate->write_zeroes && !verify) {
+                            if (restore_write_data(vmar, dev_id, bs, vmstate_fd,
+                                                   zero_vma_block, sector_num,
+                                                   nb_sectors, errp) < 0) {
+                                return -1;
+                            }
                         }
                     }
                 }
@@ -679,8 +707,9 @@ static int restore_extent(VmaReader *vmar, unsigned char *buf,
     return 0;
 }
 
-int vma_reader_restore(VmaReader *vmar, int vmstate_fd, bool verbose,
-                       Error **errp)
+static int vma_reader_restore_full(VmaReader *vmar, int vmstate_fd, 
+                                   bool verbose, bool verify,
+                                   Error **errp)
 {
     assert(vmar);
     assert(vmar->head_data);
@@ -747,7 +776,7 @@ int vma_reader_restore(VmaReader *vmar, int vmstate_fd, bool verbose,
         }
 
         if (restore_extent(vmar, buf, extent_size, vmstate_fd, verbose,
-                           errp) < 0) {
+                           verify, errp) < 0) {
             return -1;
         }
 
@@ -794,6 +823,35 @@ int vma_reader_restore(VmaReader *vmar, int vmstate_fd, bool verbose,
         }
     }
 
+    if (verbose) {
+        printf("total bytes read %zd, sparse bytes %zd (%.3g%%)\n",
+               vmar->clusters_read*VMA_CLUSTER_SIZE,
+               vmar->zero_cluster_data,
+               (double)(100.0*vmar->zero_cluster_data)/
+               (vmar->clusters_read*VMA_CLUSTER_SIZE));
+        printf("space reduction due to 4K zero bocks %.3g%%\n",
+               (double)(100.0*vmar->partial_zero_cluster_data) /
+               (vmar->clusters_read*VMA_CLUSTER_SIZE-vmar->zero_cluster_data));
+    }
     return ret;
+}
+
+int vma_reader_restore(VmaReader *vmar, int vmstate_fd, bool verbose,
+                       Error **errp)
+{
+    return vma_reader_restore_full(vmar, vmstate_fd, verbose, false, errp);
+}
+
+int vma_reader_verify(VmaReader *vmar, bool verbose, Error **errp)
+{
+    guint8 dev_id;
+
+    for (dev_id = 1; dev_id < 255; dev_id++) {
+        if (vma_reader_get_device_info(vmar, dev_id)) {
+            allocate_rstate(vmar, dev_id, NULL, false);
+        }
+    }
+
+    return vma_reader_restore_full(vmar, -1, verbose, true, errp);
 }
 
