@@ -465,7 +465,13 @@ int vma_reader_register_bs(VmaReader *vmar, guint8 dev_id, BlockDriverState *bs,
     assert(vmar->rstate[dev_id].bs == NULL);
 
     int64_t size = bdrv_getlength(bs);
-    if (size != vmar->devinfo[dev_id].size) {
+    int64_t size_diff = size - vmar->devinfo[dev_id].size;
+
+    /* storage types can have different size restrictions, so it
+     * is not always possible to create an image with exact size.
+     * So we tolerate a size difference up to 4MB.
+     */
+    if ((size_diff < 0) || (size_diff > 4*1024*1024)) {
         error_setg(errp, "vma_reader_register_bs for stream %s failed - "
                    "unexpected size %zd != %zd", vmar->devinfo[dev_id].devname,
                    size, vmar->devinfo[dev_id].size);
