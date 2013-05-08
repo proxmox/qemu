@@ -33,7 +33,7 @@ static void help(void)
         "\n"
         "vma list <filename>\n"
         "vma create <filename> [-c config] <archive> pathname ...\n"
-        "vma extract <filename> [-v] [-r] <targetdir>\n"
+        "vma extract <filename> [-v] [-r <fifo>] <targetdir>\n"
         "vma verify <filename> [-v]\n"
         ;
 
